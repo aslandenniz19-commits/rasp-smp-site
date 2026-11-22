@@ -47,6 +47,7 @@ function defaults() {
       { id: uid(), name: '5000 Oyun Parası', category: 'Para', price: 49, description: 'Sunucu içi ekonomi için 5000 para.', active: true },
     ],
     orders: [],
+    secrets: { paytr: { merchantId: '', merchantKey: '', merchantSalt: '', testMode: false, lastError: null } },
     tickets: [],
     forms: [
       {
@@ -71,7 +72,7 @@ function defaults() {
       discord: '',
       about: 'RASP SMP; adil kurallar, aktif yetkili ekibi ve topluluk odaklı bir survival sunucusudur.',
       rules: 'Hile ve bug kullanımı yasaktır.\nDiğer oyunculara küfür ve hakaret yasaktır.\nGrief ve çalmak yasaktır.\nYetkililerin kararlarına saygı göster.',
-      paymentNote: 'Sipariş verdikten sonra ödeme için Discord\'dan veya Destek bölümünden bir talep aç. Ödeme onaylanınca ürün hesabına tanımlanır.',
+      paymentNote: 'Sipariş verdikten sonra kartla veya havale/EFT ile ödeyebilirsin. Ödeme onaylanınca ürün hesabına tanımlanır.',
       iban: 'TR19 0001 0090 1078 2727 1050 01',
       ibanName: '', // alıcı adı soyadı (panelden / Site Ayarları'ndan gir)
       texts: {}, // sitedeki yazıların sahip tarafından değiştirilmiş halleri
@@ -209,7 +210,7 @@ function route(method, pattern, opts, handler) {
 
 /* ---- Genel ---- */
 route('GET', '/api/public', {}, () => ({
-  settings: db.settings,
+  settings: { ...db.settings, cardEnabled: !!paytrCfg() },
   announcements: [...db.announcements].sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, 5),
   openForms: db.forms.filter((f) => f.open).length,
 }));
@@ -298,11 +299,140 @@ route('GET', '/api/orders', { auth: true }, (c) => {
 route('POST', '/api/orders/:id/status', { perm: 'orders' }, (c) => {
   const o = db.orders.find((x) => x.id === c.params.id);
   if (!o) throw new HttpError(404, 'Sipariş bulunamadı.');
-  if (!['pending', 'delivered', 'cancelled'].includes(c.body.status)) throw bad('Geçersiz durum.');
+  if (!['pending', 'paid', 'delivered', 'cancelled'].includes(c.body.status)) throw bad('Geçersiz durum.');
   o.status = c.body.status;
   o.handledBy = c.user.username;
   save();
   return o;
+});
+
+/* ---- Kartla ödeme (PayTR iFrame API) ----
+   Kart bilgisi bu sitede ASLA girilmez; PayTR'ın güvenli sayfası iframe içinde açılır.
+   Ödeme sonucu PayTR'dan imzalı bildirim (callback) ile gelir ve sipariş otomatik "Ödendi" olur. */
+function paytrCfg() {
+  const s = (db.secrets && db.secrets.paytr) || {};
+  const id = process.env.PAYTR_MERCHANT_ID || s.merchantId;
+  const key = process.env.PAYTR_MERCHANT_KEY || s.merchantKey;
+  const salt = process.env.PAYTR_MERCHANT_SALT || s.merchantSalt;
+  if (!id || !key || !salt) return null;
+  const test = process.env.PAYTR_TEST_MODE !== undefined ? process.env.PAYTR_TEST_MODE === '1' : !!s.testMode;
+  return { id: String(id), key: String(key), salt: String(salt), test };
+}
+const hmac64 = (data, key) => crypto.createHmac('sha256', key).update(data).digest('base64');
+function baseUrl(req) {
+  if (process.env.BASE_URL) return process.env.BASE_URL.replace(/\/+$/, '');
+  const proto = req.headers['x-forwarded-proto'] === 'https' ? 'https' : 'http';
+  return `${proto}://${req.headers.host}`;
+}
+function paytrState(req) {
+  const s = db.secrets.paytr;
+  return {
+    configured: !!paytrCfg(), fromEnv: !!process.env.PAYTR_MERCHANT_ID, merchantId: s.merchantId || '',
+    hasKey: !!s.merchantKey, hasSalt: !!s.merchantSalt, testMode: !!s.testMode, lastError: s.lastError || null,
+    callbackUrl: baseUrl(req) + '/api/paytr/callback',
+  };
+}
+const ownerOnly = (c) => { if (c.user.role !== 'owner') throw new HttpError(403, 'Bu ayarı sadece sahip değiştirebilir.'); };
+
+route('POST', '/api/orders/:id/pay', { auth: true }, async (c) => {
+  limit('pay:' + c.user.id, 10, 10 * 60e3);
+  const cfg = paytrCfg();
+  if (!cfg) throw bad('Kartla ödeme şu an kapalı.');
+  const o = db.orders.find((x) => x.id === c.params.id && x.userId === c.user.id);
+  if (!o) throw new HttpError(404, 'Sipariş bulunamadı.');
+  if (o.status !== 'pending') throw bad('Bu sipariş için ödeme beklenmiyor.');
+  const amount = Math.round(o.price * 100);
+  if (amount <= 0) throw bad('Bu siparişin tutarı 0, ödeme gerekmiyor.');
+  const email = str(c.body.email, 100, 'E-posta', { required: true });
+  if (!/^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$/.test(email)) throw bad('Geçerli bir e-posta yaz (Türkçe karakter olmadan).');
+  const phone = String(c.body.phone || '').replace(/[^\d+]/g, '');
+  if (phone.length < 10 || phone.length > 15) throw bad('Telefon numarası geçersiz.');
+
+  const attempt = (o.payAttempts || 0) + 1;
+  const oid = 'RASP' + o.id + 'N' + attempt; // yalnızca harf-rakam, her deneme için benzersiz
+  const ip = clientIp(c.req).replace(/^::ffff:/, '');
+  const basket = Buffer.from(JSON.stringify([[o.productName, o.price.toFixed(2), 1]])).toString('base64');
+  const testMode = cfg.test ? '1' : '0';
+  const paytr_token = hmac64([cfg.id, ip, oid, email, amount, basket, '0', '0', 'TL', testMode].join('') + cfg.salt, cfg.key);
+  const base = baseUrl(c.req);
+  const form = new URLSearchParams({
+    merchant_id: cfg.id, user_ip: ip, merchant_oid: oid, email, payment_amount: String(amount), paytr_token,
+    user_basket: basket, debug_on: '0', no_installment: '0', max_installment: '0', user_name: c.user.username,
+    user_address: 'Dijital urun - teslimat yok', user_phone: phone, merchant_ok_url: base + '/#/store',
+    merchant_fail_url: base + '/#/store', timeout_limit: '30', currency: 'TL', test_mode: testMode, lang: 'tr',
+  });
+  let data;
+  try {
+    const r = await fetch('https://www.paytr.com/odeme/api/get-token', { method: 'POST', body: form, signal: AbortSignal.timeout(15000) });
+    data = await r.json();
+  } catch (e) {
+    console.error('PayTR bağlantı hatası:', e.message);
+    db.secrets.paytr.lastError = { at: now(), reason: 'PayTR\'a ulaşılamadı: ' + e.message };
+    save();
+    throw new HttpError(502, 'Ödeme sağlayıcıya ulaşılamadı. Biraz sonra tekrar dene.');
+  }
+  if (!data || data.status !== 'success' || !data.token) {
+    const reason = String((data && data.reason) || 'bilinmeyen hata').slice(0, 300);
+    console.error('PayTR token hatası:', reason);
+    db.secrets.paytr.lastError = { at: now(), reason };
+    save();
+    throw new HttpError(502, 'Ödeme başlatılamadı. Biraz sonra tekrar dene.');
+  }
+  o.payAttempts = attempt;
+  o.merchantOids = [...(o.merchantOids || []), oid];
+  save();
+  return { token: data.token };
+});
+
+// PayTR sunucusu buraya imzalı bildirim yollar. Oturum gerektirmez, cevap düz "OK" olmalıdır.
+route('POST', '/api/paytr/callback', {}, (c) => {
+  const cfg = paytrCfg();
+  if (!cfg) throw new HttpError(503, 'kapalı');
+  const b = c.body;
+  const expected = Buffer.from(hmac64(String(b.merchant_oid) + cfg.salt + String(b.status) + String(b.total_amount), cfg.key));
+  const got = Buffer.from(String(b.hash || ''));
+  if (expected.length !== got.length || !crypto.timingSafeEqual(expected, got)) throw new HttpError(400, 'Geçersiz imza.');
+  const o = db.orders.find((x) => (x.merchantOids || []).includes(String(b.merchant_oid)));
+  if (!o) return 'OK';
+  if (b.status === 'success') {
+    if (o.paidAt) return 'OK'; // tekrar bildirim: sadece OK dön
+    if (Number(b.payment_amount) !== Math.round(o.price * 100)) {
+      o.amountMismatch = true; // tutar uyuşmuyorsa otomatik onaylama
+      console.error(`PayTR tutar uyuşmazlığı: sipariş ${o.code}, beklenen ${Math.round(o.price * 100)}, gelen ${b.payment_amount}`);
+    } else {
+      o.paidAt = now();
+      o.paymentType = b.payment_type === 'eft' ? 'eft' : 'card';
+      o.testPayment = String(b.test_mode) === '1';
+      if (o.status === 'pending') o.status = 'paid';
+      else if (o.status === 'cancelled') o.paidAfterCancel = true;
+    }
+  } else {
+    o.lastPayError = String(b.failed_reason_msg || 'Ödeme başarısız').slice(0, 200);
+  }
+  save();
+  return 'OK';
+});
+
+route('GET', '/api/admin/paytr', { perm: 'settings' }, (c) => { ownerOnly(c); return paytrState(c.req); });
+route('PUT', '/api/admin/paytr', { perm: 'settings' }, (c) => {
+  ownerOnly(c);
+  const s = db.secrets.paytr;
+  if (c.body.clear) {
+    Object.assign(s, { merchantId: '', merchantKey: '', merchantSalt: '', testMode: false, lastError: null });
+  } else {
+    const field = (v, name) => {
+      const x = typeof v === 'string' ? v.trim() : '';
+      if (x && !/^[\x21-\x7E]{1,100}$/.test(x)) throw bad(`${name} geçersiz karakter içeriyor.`);
+      return x;
+    };
+    const id = field(c.body.merchantId, 'Mağaza no'), key = field(c.body.merchantKey, 'Mağaza anahtarı'), salt = field(c.body.merchantSalt, 'Mağaza gizli anahtarı (salt)');
+    if (id) s.merchantId = id;
+    if (key) s.merchantKey = key;
+    if (salt) s.merchantSalt = salt;
+    s.testMode = !!c.body.testMode;
+  }
+  save();
+  return paytrState(c.req);
 });
 
 function productFields(b) {
@@ -434,7 +564,7 @@ route('GET', '/api/admin/stats', { staff: true }, () => ({
   staff: db.users.filter(isStaff).length,
   openTickets: db.tickets.filter((t) => t.status !== 'closed').length,
   pendingApps: db.applications.filter((a) => a.status === 'pending').length,
-  pendingOrders: db.orders.filter((o) => o.status === 'pending').length,
+  pendingOrders: db.orders.filter((o) => o.status === 'pending' || o.status === 'paid').length,
   revenue: db.orders.filter((o) => o.status === 'delivered').reduce((s, o) => s + o.price, 0),
 }));
 
@@ -553,6 +683,9 @@ function readBody(req) {
     });
     req.on('end', () => {
       if (!chunks.length) return resolve({});
+      if (String(req.headers['content-type'] || '').includes('application/x-www-form-urlencoded')) {
+        return resolve(Object.fromEntries(new URLSearchParams(Buffer.concat(chunks).toString('utf8'))));
+      }
       try { const v = JSON.parse(Buffer.concat(chunks).toString('utf8')); resolve(v && typeof v === 'object' ? v : {}); }
       catch { reject(bad('Geçersiz JSON.')); }
     });
@@ -578,6 +711,7 @@ async function handleApi(req, res, url) {
     route_.keys.forEach((k, i) => { params[k] = decodeURIComponent(m[i + 1]); });
     const body = req.method === 'GET' || req.method === 'DELETE' ? {} : await readBody(req);
     const out = await route_.handler({ req, res, user, params, body, query: url.searchParams });
+    if (typeof out === 'string') return send(res, 200, out, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' });
     sendJson(res, 200, out);
   } catch (e) {
     if (e instanceof HttpError) return sendJson(res, e.status, { error: e.message });

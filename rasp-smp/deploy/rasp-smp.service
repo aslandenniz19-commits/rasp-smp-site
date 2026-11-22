@@ -1,0 +1,13 @@
+[Unit]
+Description=RASP SMP site
+After=network.target
+
+[Service]
+WorkingDirectory=/opt/rasp-smp
+EnvironmentFile=/opt/rasp-smp/.env
+ExecStart=/usr/bin/node server.js
+Restart=always
+User=rasp
+
+[Install]
+WantedBy=multi-user.target

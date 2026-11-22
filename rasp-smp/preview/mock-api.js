@@ -28,7 +28,7 @@
       name: 'RASP SMP', tagline: 'Arkadaşlarınla birlikte yaşa, inşa et, hayatta kal.', ip: 'play.raspsmp.com', version: '1.21+', discord: '',
       about: 'RASP SMP; adil kurallar, aktif yetkili ekibi ve topluluk odaklı bir survival sunucusudur.',
       rules: 'Hile ve bug kullanımı yasaktır.\nDiğer oyunculara küfür ve hakaret yasaktır.\nGrief ve çalmak yasaktır.\nYetkililerin kararlarına saygı göster.',
-      paymentNote: "Sipariş verdikten sonra ödeme için Discord'dan veya Destek bölümünden bir talep aç. Ödeme onaylanınca ürün hesabına tanımlanır.",
+      paymentNote: 'Sipariş verdikten sonra kartla veya havale/EFT ile ödeyebilirsin. Ödeme onaylanınca ürün hesabına tanımlanır.',
       iban: 'TR19 0001 0090 1078 2727 1050 01', ibanName: '',
     },
   });
@@ -65,7 +65,7 @@
   const R = [];
   const route = (m, p, o, h) => { const k = []; const re = new RegExp('^' + p.replace(/:(\w+)/g, (_, n) => { k.push(n); return '([^/]+)'; }) + '$'); R.push({ m, re, k, o, h }); };
 
-  route('GET', '/api/public', {}, () => ({ settings: db.settings, announcements: [...db.announcements].sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, 5), openForms: db.forms.filter((f) => f.open).length }));
+  route('GET', '/api/public', {}, () => ({ settings: { ...db.settings, cardEnabled: true }, announcements: [...db.announcements].sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, 5), openForms: db.forms.filter((f) => f.open).length }));
   route('GET', '/api/me', {}, (c) => ({ user: c.user ? pub(c.user) : null, allPermissions: PERMS }));
   route('POST', '/api/register', {}, (c) => {
     const username = str(c.body.username, 20, 'Kullanıcı adı', { required: true });
@@ -111,6 +111,22 @@
     db.orders.push(o); save(); return o;
   });
   route('GET', '/api/orders', { auth: true }, (c) => db.orders.filter((o) => (c.q.get('all') === '1' && can(c.user, 'orders')) || o.userId === c.user.id).sort((a, b) => b.createdAt.localeCompare(a.createdAt)));
+  route('POST', '/api/orders/:id/pay', { auth: true }, (c) => {
+    const o = db.orders.find((x) => x.id === c.p.id && x.userId === c.user.id);
+    if (!o) throw new E(404, 'Sipariş bulunamadı.');
+    if (!/^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$/.test(c.body.email || '')) throw bad('Geçerli bir e-posta yaz (Türkçe karakter olmadan).');
+    if (String(c.body.phone || '').replace(/[^\d+]/g, '').length < 10) throw bad('Telefon numarası geçersiz.');
+    return { demo: true };
+  });
+  route('POST', '/api/orders/:id/demo-pay', { auth: true }, (c) => {
+    const o = db.orders.find((x) => x.id === c.p.id && x.userId === c.user.id);
+    if (!o) throw new E(404, 'Sipariş bulunamadı.');
+    if (o.status === 'pending') { o.status = 'paid'; o.paidAt = now(); o.paymentType = 'card'; o.testPayment = true; save(); }
+    return { ok: true };
+  });
+  const paytrDemo = (req) => ({ configured: true, fromEnv: false, merchantId: 'DEMO', hasKey: true, hasSalt: true, testMode: true, lastError: null, callbackUrl: 'https://siteniz.com/api/paytr/callback' });
+  route('GET', '/api/admin/paytr', { perm: 'settings' }, (c) => { if (c.user.role !== 'owner') throw new E(403, 'Bu ayarı sadece sahip değiştirebilir.'); return paytrDemo(); });
+  route('PUT', '/api/admin/paytr', { perm: 'settings' }, (c) => { if (c.user.role !== 'owner') throw new E(403, 'Bu ayarı sadece sahip değiştirebilir.'); return paytrDemo(); });
   route('POST', '/api/orders/:id/status', { perm: 'orders' }, (c) => { const o = db.orders.find((x) => x.id === c.p.id); if (!o) throw new E(404, 'Sipariş bulunamadı.'); o.status = c.body.status; save(); return o; });
 
   const tv = (t) => ({ ...t, messages: undefined, messageCount: t.messages.length });
@@ -154,7 +170,7 @@
 
   route('GET', '/api/admin/stats', { staff: true }, () => ({
     users: db.users.length, staff: db.users.filter(isStaff).length, openTickets: db.tickets.filter((t) => t.status !== 'closed').length,
-    pendingApps: db.applications.filter((a) => a.status === 'pending').length, pendingOrders: db.orders.filter((o) => o.status === 'pending').length,
+    pendingApps: db.applications.filter((a) => a.status === 'pending').length, pendingOrders: db.orders.filter((o) => o.status === 'pending' || o.status === 'paid').length,
     revenue: db.orders.filter((o) => o.status === 'delivered').reduce((s, o) => s + o.price, 0),
   }));
   route('GET', '/api/admin/users', { perm: 'users' }, (c) => db.users.map((u) => ({ ...pub(u), manageable: canManage(c.user, u) })));

@@ -34,7 +34,7 @@ function toast(msg, err = false) {
 const guard = async (fn) => { try { await fn(); } catch (e) { toast(e.message, true); } };
 
 const STATUS = {
-  pending: ['Beklemede', 'yellow'], delivered: ['Teslim edildi', 'green'], cancelled: ['İptal', 'red'],
+  pending: ['Beklemede', 'yellow'], paid: ['Ödendi · teslim bekliyor', 'blue'], delivered: ['Teslim edildi', 'green'], cancelled: ['İptal', 'red'],
   accepted: ['Kabul edildi', 'green'], rejected: ['Reddedildi', 'red'],
   open: ['Açık', 'yellow'], answered: ['Yanıtlandı', 'blue'], closed: ['Kapalı', 'red'],
 };
@@ -54,20 +54,95 @@ function payRows(S, o) {
   if (o) h += row('Tutar', money(o.price), String(o.price)) + row('Açıklama (zorunlu)', esc(oc(o)), oc(o));
   return h;
 }
+let payPoll = null;
+const stopPoll = () => { if (payPoll) { clearInterval(payPoll); payPoll = null; } };
 function showPayment(o) {
   const S = state.pub.settings;
   closeModal();
   const m = document.createElement('div');
   m.id = 'modal'; m.className = 'modal-back';
-  m.innerHTML = `<div class="modal card" role="dialog" aria-modal="true" aria-label="Ödeme bilgileri"><h3>Sipariş alındı</h3>
-    <p class="muted">${esc(o.productName)} · ${money(o.price)} · ${esc(o.mcname)}</p>
-    ${S.iban ? `<p>Ödemeyi havale / EFT ile yap. <b>Açıklama kısmına sipariş kodunu yazmayı unutma</b>, yoksa ödemeni eşleştiremeyiz.</p>${payRows(S, o)}
-    <p class="muted small">Ödeme kontrol edilince ürün hesabına tanımlanır. Siparişini Mağaza sayfasındaki "Siparişlerim" bölümünden takip edebilirsin.</p>`
-    : `<p>${esc(S.paymentNote)}</p>`}
-    <div class="row"><button type="button" class="btn" data-m="cancel">Tamam</button></div></div>`;
+  m.innerHTML = '<div class="modal card" role="dialog" aria-modal="true" aria-label="Ödeme"><div id="payBody"></div></div>';
   document.body.appendChild(m);
+  const box = $('.modal', m), body = $('#payBody', m);
+  const summary = `<p class="muted">${esc(o.productName)} · <b style="color:var(--text)">${money(o.price)}</b> · ${esc(o.mcname)} · <code>${esc(oc(o))}</code></p>`;
+  const closeBtn = '<div class="row" style="margin-top:16px"><button type="button" class="btn ghost" data-m="close">Kapat</button></div>';
+  const backBtn = (both) => both ? '<button type="button" class="btn ghost" data-m="home">← Geri</button>' : '';
+  const both = !!(S.cardEnabled && S.iban);
+
+  const bank = () => {
+    box.classList.remove('wide');
+    body.innerHTML = `<h3>Havale / EFT ile öde</h3>${summary}
+      <p>Açıklama kısmına <b>sipariş kodunu</b> yaz, yoksa ödemeni eşleştiremeyiz.</p>${payRows(S, o)}
+      <p class="muted small">Ödeme kontrol edilince ürün hesabına tanımlanır. Siparişini "Siparişlerim" bölümünden takip edebilirsin.</p>
+      <div class="row" style="margin-top:16px">${backBtn(both)}<button type="button" class="btn" data-m="close">Tamam</button></div>`;
+  };
+  const watch = () => {
+    stopPoll();
+    payPoll = setInterval(async () => {
+      try {
+        const cur = (await api('/orders')).find((x) => x.id === o.id);
+        if (cur && (cur.status === 'paid' || cur.status === 'delivered')) { closeModal(); toast('Ödemen alındı! Ürün kısa süre içinde teslim edilecek.'); render(true); }
+      } catch { /* sonraki turda tekrar dener */ }
+    }, 4000);
+  };
+  const card = () => {
+    box.classList.remove('wide');
+    let saved = {};
+    try { saved = JSON.parse(localStorage.getItem('rasp-pay-contact') || '{}'); } catch { /* yoksay */ }
+    body.innerHTML = `<h3>Kartla öde</h3>${summary}
+      <p class="muted small">PayTR sana ödeme için e-posta ve telefon soruyor. Kart bilgilerini bir sonraki adımda PayTR'ın güvenli sayfasına girersin, bu sitede saklanmaz.</p>
+      <form id="payForm"><div class="field"><label for="pe">E-posta</label><input id="pe" name="email" type="email" required maxlength="100" value="${esc(saved.email || '')}" autocomplete="email"></div>
+      <div class="field"><label for="pp">Telefon</label><input id="pp" name="phone" type="tel" required maxlength="20" placeholder="05xx xxx xx xx" value="${esc(saved.phone || '')}" autocomplete="tel"></div>
+      <div class="row"><button class="btn">Ödemeye Geç</button>${backBtn(both)}<button type="button" class="btn ghost" data-m="close">Vazgeç</button></div></form>`;
+    $('#payForm', m).addEventListener('submit', (e) => {
+      e.preventDefault();
+      const d = formData(e.target);
+      const btn = $('button', e.target); btn.disabled = true;
+      guard(async () => {
+        try { localStorage.setItem('rasp-pay-contact', JSON.stringify(d)); } catch { /* yoksay */ }
+        const r = await api(`/orders/${o.id}/pay`, 'POST', d);
+        if (r.demo) demo(); else frame(r.token);
+      }).finally(() => { btn.disabled = false; });
+    });
+  };
+  const frame = (token) => {
+    box.classList.add('wide');
+    body.innerHTML = `<h3>Kartla öde</h3>${summary}
+      <iframe id="paytriframe" title="PayTR güvenli ödeme" src="https://www.paytr.com/odeme/guvenli/${encodeURIComponent(token)}" style="width:100%;border:0;min-height:520px" scrolling="no"></iframe>
+      <p class="muted small">Ödeme tamamlanınca bu pencere kendiliğinden kapanır.</p>${closeBtn}`;
+    const sc = document.createElement('script');
+    sc.src = 'https://www.paytr.com/js/iframeResizer.min.js';
+    sc.onload = () => { if (window.iFrameResize) window.iFrameResize({}, '#paytriframe'); };
+    document.head.appendChild(sc);
+    watch();
+  };
+  const demo = () => {
+    body.innerHTML = `<h3>Önizleme</h3>${summary}
+      <div class="alert">Gerçek sitede burada PayTR'ın güvenli kart sayfası açılır. Önizlemede kart bilgisi alınmaz, aşağıdaki düğme ödemenin tamamlanmasını taklit eder.</div>
+      <div class="row"><button type="button" class="btn" data-m="demoPaid">Ödemeyi başarılı say (demo)</button><button type="button" class="btn ghost" data-m="close">Vazgeç</button></div>`;
+  };
+  const home = () => {
+    box.classList.remove('wide');
+    body.innerHTML = `<h3>Sipariş alındı</h3>${summary}<p>Ödeme yöntemini seç:</p>
+      <div class="row"><button type="button" class="btn" data-m="card">💳 Kartla öde</button><button type="button" class="btn ghost" data-m="bank">Havale / EFT</button></div>${closeBtn}`;
+  };
+
   m.addEventListener('mousedown', (e) => { if (e.target === m) closeModal(); });
-  m.addEventListener('click', (e) => { if (e.target.closest('[data-m="cancel"]')) closeModal(); });
+  m.addEventListener('click', (e) => {
+    const b = e.target.closest('[data-m]');
+    if (!b) return;
+    const act = b.dataset.m;
+    if (act === 'close') closeModal();
+    else if (act === 'home') home();
+    else if (act === 'card') card();
+    else if (act === 'bank') bank();
+    else if (act === 'demoPaid') guard(async () => { await api(`/orders/${o.id}/demo-pay`, 'POST'); closeModal(); toast('Ödeme alındı (demo).'); render(true); });
+  });
+
+  if (both) home();
+  else if (S.cardEnabled) card();
+  else if (S.iban) bank();
+  else body.innerHTML = `<h3>Sipariş alındı</h3>${summary}<p>${esc(S.paymentNote)}</p>${closeBtn}`;
 }
 const es = (f, tag = 'span', cls = '') => `<${tag} data-edit="s:${f}"${cls ? ` class="${cls}"` : ''}>${esc(state.pub.settings[f])}</${tag}>`;
 
@@ -201,7 +276,7 @@ async function store(app, [cat]) {
     const orders = await api('/orders');
     mine = `<section class="section">${ed('store_orders', 'Siparişlerim', 'h2')}${orders.length ? `<div class="tablewrap"><table>
       <tr><th>Ürün</th><th>Fiyat</th><th>Oyuncu</th><th>Kod</th><th>Tarih</th><th>Durum</th><th></th></tr>
-      ${orders.map((o) => `<tr><td>${esc(o.productName)}</td><td>${money(o.price)}</td><td>${esc(o.mcname)}</td><td><code>${esc(oc(o))}</code></td><td>${fmtDate(o.createdAt)}</td><td>${badge(o.status)}</td><td>${o.status === 'pending' && state.pub.settings.iban ? `<button class="btn sm" data-act="payInfo" data-id="${esc(o.id)}">Ödeme bilgisi</button>` : ''}</td></tr>`).join('')}
+      ${orders.map((o) => `<tr><td>${esc(o.productName)}</td><td>${money(o.price)}</td><td>${esc(o.mcname)}</td><td><code>${esc(oc(o))}</code></td><td>${fmtDate(o.createdAt)}</td><td>${badge(o.status)}</td><td>${o.status === 'pending' && (state.pub.settings.iban || state.pub.settings.cardEnabled) ? `<button class="btn sm" data-act="payInfo" data-id="${esc(o.id)}">Öde</button>` : ''}</td></tr>`).join('')}
       </table></div>` : '<div class="empty">Henüz siparişin yok.</div>'}</section>`;
   }
   app.innerHTML = `${ed('store_title', 'Mağaza', 'h1', 'h1s')}
@@ -295,6 +370,7 @@ const TABS = [
   ['applications', 'Başvurular', () => hasPerm('applications')],
   ['announcements', 'Duyurular', () => hasPerm('announcements')],
   ['settings', 'Site Ayarları', () => hasPerm('settings')],
+  ['payment', 'Kartla Ödeme', () => state.user?.role === 'owner'],
 ];
 
 async function admin(app, [tab = 'overview']) {
@@ -356,7 +432,7 @@ const adminTabs = {
     const os = await api('/orders?all=1');
     el.innerHTML = `<h2>Siparişler</h2>${os.length ? `<div class="tablewrap"><table>
       <tr><th>Tarih</th><th>Kod</th><th>Kullanıcı</th><th>MC adı</th><th>Ürün</th><th>Fiyat</th><th>Durum</th><th></th></tr>
-      ${os.map((o) => `<tr data-id="${esc(o.id)}"><td>${fmtDate(o.createdAt)}</td><td><code>${esc(oc(o))}</code></td><td>${esc(o.username)}</td><td>${esc(o.mcname)}</td><td>${esc(o.productName)}</td><td>${money(o.price)}</td><td>${badge(o.status)}</td>
+      ${os.map((o) => `<tr data-id="${esc(o.id)}"><td>${fmtDate(o.createdAt)}</td><td><code>${esc(oc(o))}</code></td><td>${esc(o.username)}</td><td>${esc(o.mcname)}</td><td>${esc(o.productName)}</td><td>${money(o.price)}</td><td>${badge(o.status)}${o.testPayment ? ' <span class="badge">Test</span>' : ''}${o.paymentType ? ` <span class="badge">${o.paymentType === 'eft' ? 'EFT' : 'Kart'}</span>` : ''}${o.amountMismatch && !o.paidAt ? ' <span class="badge red">Tutar uyuşmuyor</span>' : ''}${o.paidAfterCancel ? ' <span class="badge red">İptal sonrası ödeme geldi</span>' : ''}</td>
       <td><div class="row">${o.status !== 'delivered' ? '<button class="btn sm" data-act="orderStatus" data-s="delivered">Teslim Et</button>' : ''}${o.status !== 'cancelled' ? '<button class="btn sm danger" data-act="orderStatus" data-s="cancelled">İptal</button>' : ''}${o.status !== 'pending' ? '<button class="btn sm ghost" data-act="orderStatus" data-s="pending">Beklemeye Al</button>' : ''}</div></td></tr>`).join('')}
       </table></div>` : '<div class="empty">Sipariş yok.</div>'}`;
   },
@@ -404,6 +480,30 @@ const adminTabs = {
       <h3 style="margin-top:24px">Yayındakiler (son 5)</h3>${announcements.map((a) => `<div class="card row between" style="margin-bottom:10px" data-id="${esc(a.id)}"><div><b>${esc(a.title)}</b><div class="muted small">${fmtDate(a.createdAt)}</div></div><button class="btn sm danger" data-act="delAnn">Sil</button></div>`).join('') || '<div class="empty">Duyuru yok.</div>'}`;
   },
 
+
+  async payment(el) {
+    const p = await api('/admin/paytr');
+    const copyRow = (label, val) => `<div class="payrow"><div><div class="muted small">${label}</div><div class="payval">${esc(val)}</div></div><button type="button" class="btn sm ghost" data-act="copy" data-v="${esc(val)}">Kopyala</button></div>`;
+    el.innerHTML = `<h2>Kartla Ödeme (PayTR)</h2>
+    <div class="alert ${p.configured ? 'ok' : ''}">${p.configured ? 'Kartla ödeme <b>açık</b>. Oyuncular siparişte "Kartla öde"yi görüyor.' : 'Kartla ödeme şu an <b>kapalı</b>. Aşağıya PayTR bilgilerini girince açılır.'}${p.fromEnv ? ' (Bilgiler sunucu ortam değişkenlerinden geliyor.)' : ''}</div>
+    <div class="card" style="margin-bottom:16px"><h3>Kurulum</h3><ol class="rules">
+      <li>PayTR'da mağaza hesabı aç ve onaylat.</li>
+      <li>PayTR mağaza panelinden <b>Mağaza no</b>, <b>Mağaza anahtarı</b> ve <b>Mağaza gizli anahtarı</b> değerlerini al, aşağıya gir.</li>
+      <li>PayTR panelinde <b>Bildirim URL</b> alanına şu adresi yaz (sitenin yayında olduğu adres, https ile):</li></ol>
+      ${copyRow('Bildirim URL', p.callbackUrl)}
+      <p class="muted small" style="margin:8px 0 0">Para PayTR üzerinden senin banka hesabına, PayTR'ın kendi ödeme takvimine göre yatar. Bu site para tutmaz.</p></div>
+    ${p.lastError ? `<div class="alert err"><b>Son PayTR hatası</b> (${fmtDate(p.lastError.at)}): ${esc(p.lastError.reason)}</div>` : ''}
+    <div class="card"><form data-form="paytr">
+      <div class="grid g2">
+        <div class="field"><label for="pm">Mağaza no</label><input id="pm" name="merchantId" value="${esc(p.merchantId)}" maxlength="100" autocomplete="off"></div>
+        <div class="field"><label for="pk">Mağaza anahtarı ${p.hasKey ? '(kayıtlı, boş bırakırsan değişmez)' : ''}</label><input id="pk" name="merchantKey" type="password" maxlength="100" autocomplete="new-password" placeholder="${p.hasKey ? '••••••••' : ''}"></div>
+      </div>
+      <div class="field"><label for="ps">Mağaza gizli anahtarı / salt ${p.hasSalt ? '(kayıtlı, boş bırakırsan değişmez)' : ''}</label><input id="ps" name="merchantSalt" type="password" maxlength="100" autocomplete="new-password" placeholder="${p.hasSalt ? '••••••••' : ''}"></div>
+      <label class="check" style="margin-bottom:14px"><input type="checkbox" name="testMode" ${p.testMode ? 'checked' : ''}> Test modu (gerçek para çekilmez; canlıya geçince kapat)</label>
+      <div class="row"><button class="btn">Kaydet</button><button type="button" class="btn danger" data-act="paytrClear">Bilgileri sil ve kapat</button></div>
+    </form></div>`;
+  },
+
   async settings(el) {
     const s = state.pub.settings;
     const f = (n, l, v, extra = '') => `<div class="field"><label>${l}</label><input name="${n}" value="${esc(v)}" ${extra}></div>`;
@@ -448,6 +548,11 @@ const submits = {
     toast('Başvurun gönderildi!'); location.hash = '#/apply';
   },
   async announcement(f) { await api('/announcements', 'POST', formData(f)); toast('Duyuru yayınlandı.'); render(); },
+  async paytr(f) {
+    const d = formData(f);
+    await api('/admin/paytr', 'PUT', { merchantId: d.merchantId, merchantKey: d.merchantKey, merchantSalt: d.merchantSalt, testMode: f.testMode.checked });
+    state.pub = await api('/public'); toast('Kaydedildi.'); adminTabs.payment($('#tabBody'));
+  },
   async settings(f) {
     const s = await api('/settings', 'PUT', formData(f));
     state.pub.settings = s; renderNav('admin'); toast('Ayarlar kaydedildi.');
@@ -474,6 +579,11 @@ const actions = {
   async payInfo(b) {
     const o = (await api('/orders')).find((x) => x.id === b.dataset.id);
     if (o) showPayment(o);
+  },
+  async paytrClear() {
+    if (!confirm('PayTR bilgileri silinsin ve kartla ödeme kapansın mı?')) return;
+    await api('/admin/paytr', 'PUT', { clear: true });
+    state.pub = await api('/public'); toast('Kartla ödeme kapatıldı.'); adminTabs.payment($('#tabBody'));
   },
   addProduct() { return openEditor('p:new'); },
   addAnn() { return openEditor('a:new'); },
@@ -600,7 +710,7 @@ document.addEventListener('contextmenu', (e) => {
   openAdjust(el, e.clientX, e.clientY);
 });
 
-function closeModal() { $('#modal')?.remove(); }
+function closeModal() { stopPoll(); $('#modal')?.remove(); }
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape') { closeModal(); closePop(); } });
 
 async function openEditor(spec, el) {

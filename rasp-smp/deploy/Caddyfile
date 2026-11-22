@@ -1,0 +1,9 @@
+# Caddy otomatik olarak ücretsiz HTTPS sertifikası alır ve yeniler.
+www.raspsmpdfgre.com.tr {
+	redir https://raspsmpdfgre.com.tr{uri} permanent
+}
+
+raspsmpdfgre.com.tr {
+	encode gzip
+	reverse_proxy 127.0.0.1:3000
+}
